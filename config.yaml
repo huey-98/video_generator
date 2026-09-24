@@ -1,0 +1,97 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# AI 视频生成器配置
+# 官方文档：
+#   万相2.7 文生视频 https://help.aliyun.com/zh/model-studio/developer-reference/text-to-video
+#   万相2.7 参考生视频 https://help.aliyun.com/zh/model-studio/wan-video-to-video-api-reference
+#   价格 https://help.aliyun.cn/zh/model-studio/billing
+# ============================================================
+
+api:
+  # 北京地域经典域名；若业务空间配置了专属域名，可在 .env 中用 DASHSCOPE_BASE_URL 覆盖
+  base_url: "https://dashscope.aliyuncs.com/api/v1"
+  poll_interval: 5      # 任务状态轮询间隔（秒）
+  task_timeout: 3600    # 单个任务最长等待时间（秒）
+                        # 超时≠失败：任务可能仍在平台执行，界面会自动把 task_id 填进「任务续查」
+                        # 实测参考生视频(wan2.7-r2v)明显更慢：5 秒 720P 曾耗时近 29 分钟
+  download_timeout: 300 # 视频下载超时（秒）
+
+output_dir: "outputs"   # 视频与元数据保存目录
+
+defaults:
+  model: "wan2.7-t2v-2026-06-12"   # Web UI 启动时默认选中的模型
+  prompt_extend: true              # 智能改写提示词，默认开启
+  watermark: false                 # 水印，默认关闭
+
+# ------------------------------------------------------------
+# 模型注册表
+# 字段说明：
+#   id            百炼平台模型ID
+#   name          界面显示名
+#   description   界面描述
+#   duration      支持的时长范围（秒）
+#   size_param    分辨率参数名（wan2.7-t2v 用 size，其余多用 resolution）
+#   size_options  分辨率选项 [显示名, 传给API的值]
+#   ref_images    参考图配置：
+#                 enabled  是否支持 / required 是否必传 / max 最大张数
+#                 param    API 字段名（实测为 media）
+#                 item_type  media 元素的 type 取值，实测合法值只有三个：
+#                            reference_image（参考图）/ reference_video（参考视频）/ first_frame（首帧）
+#                 url_scheme any=支持本地上传(自动转 base64) / http=只接受 http(s) 图片地址
+#                 ※ 这些值均为 2026-09-24 实测平台的校验报错得出；若平台调整，改这里即可，无需改代码
+#   extra_params  该模型支持的额外参数（negative_prompt / seed / prompt_extend / watermark）
+#   price_per_second  每秒单价（元），填数字后界面会显示费用预估；null 表示不显示
+# ------------------------------------------------------------
+models:
+  - id: "wan2.7-t2v-2026-06-12"
+    name: "万相2.7 文生视频"
+    description: "纯文本生成视频：输入一段画面描述即可生成，适合从零创作。"
+    duration: { min: 2, max: 15, default: 5 }
+    size_param: "size"
+    size_options:
+      - ["720P (1280*720)", "1280*720"]
+      - ["1080P (1920*1080)", "1920*1080"]
+    ref_images: { enabled: false, required: false, max: 0, param: "media" }
+    extra_params: ["negative_prompt", "seed", "prompt_extend", "watermark"]
+    price_per_second: null
+
+  - id: "wan2.7-r2v-2026-06-12"
+    name: "万相2.7 参考生视频"
+    description: "上传 1~5 张主体参考图（人物/角色/产品），生成时锁定主体外观与特征。"
+    duration: { min: 2, max: 15, default: 5 }
+    size_param: "resolution"
+    size_options:
+      - ["720P", "720P"]
+      - ["1080P", "1080P"]
+    # 实测：平台支持本地上传（base64 会由平台自动转存到 OSS）
+    ref_images: { enabled: true, required: true, max: 5, param: "media", item_type: "reference_image", url_scheme: "any" }
+    extra_params: ["prompt_extend", "watermark"]
+    price_per_second: null
+
+  - id: "wan3.0-video"
+    name: "万相3.0 视频（标准版）"
+    description: "新一代全能模型：文生/参考生视频，最长 30 秒，30fps，原生音画同步。"
+    duration: { min: 2, max: 30, default: 5 }
+    size_param: "resolution"
+    size_options:
+      - ["480P", "480P"]
+      - ["720P", "720P"]
+      - ["1080P", "1080P"]
+    # 实测：只接受 http/https 图片地址，不支持本地上传（base64）
+    ref_images: { enabled: true, required: false, max: 10, param: "media", item_type: "reference_image", url_scheme: "http" }
+    extra_params: ["prompt_extend", "watermark"]
+    price_per_second: null
+
+  - id: "wan3.0-video-prime"
+    name: "万相3.0 视频（Prime 高速版）"
+    description: "万相3.0 高速版：能力与标准版对齐，生成速度更快，单价更高。"
+    duration: { min: 2, max: 30, default: 5 }
+    size_param: "resolution"
+    size_options:
+      - ["480P", "480P"]
+      - ["720P", "720P"]
+      - ["1080P", "1080P"]
+    # 实测：只接受 http/https 图片地址，不支持本地上传（base64）
+    ref_images: { enabled: true, required: false, max: 10, param: "media", item_type: "reference_image", url_scheme: "http" }
+    extra_params: ["prompt_extend", "watermark"]
+    price_per_second: null
