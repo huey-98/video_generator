@@ -15,11 +15,17 @@ from src.client import BailianClient, BailianError
 from src.config import load_app_config
 from src.payload import build_payload
 
-MAX_REF_FILE_MB = 8  # 单张参考图大小上限（base64 内联会放大体积，超限建议改用 URL）
-MIN_REF_SIDE = 240   # 平台要求参考图至少 240x240（实测报错：resolution must be at least 240x240）
-POLL_MAX_ERRORS = 5  # 轮询时允许的连续网络错误次数
+MAX_REF_IMAGE_MB = 8   # 单个参考图文件大小上限（base64 内联会放大体积，超限建议改用 URL）
+MAX_REF_VIDEO_MB = 30  # 单个参考视频文件大小上限（本地保护性上限，非平台实测值）
+MIN_REF_SIDE = 240     # 平台要求参考图至少 240x240（实测报错：resolution must be at least 240x240）
+POLL_MAX_ERRORS = 5    # 轮询时允许的连续网络错误次数
 
 HISTORY_HEADERS = ["时间", "模型", "提示词", "时长(秒)", "分辨率", "文件"]
+
+REF_LABELS = {"image": "参考图", "video": "参考视频"}
+
+# 提示词中引用参考素材的编号前缀（实测各类素材分别计数，序号互不占用）
+REF_PREFIX = {"image": "图", "video": "视频"}
 
 
 # 图片魔数 → MIME，平台会按内容判断文件类型，用魔数比扩展名可靠
@@ -29,6 +35,13 @@ IMAGE_MAGIC = [
     (b"GIF87a", "image/gif"),
     (b"GIF89a", "image/gif"),
     (b"BM", "image/bmp"),
+]
+
+# 视频魔数（部分在固定偏移处）
+VIDEO_MAGIC = [
+    (b"\x1aE\xdf\xa3", "video/webm"),
+    (b"\x00\x00\x01\xba", "video/mpeg"),
+    (b"OggS", "video/ogg"),
 ]
 
 
@@ -41,6 +54,18 @@ def sniff_image_mime(raw: bytes, fallback_name: str) -> str:
     return mimetypes.guess_type(fallback_name)[0] or "image/png"
 
 
+def sniff_video_mime(raw: bytes, fallback_name: str) -> str:
+    for magic, mime in VIDEO_MAGIC:
+        if raw.startswith(magic):
+            return mime
+    # MP4 / MOV 系列：第 4~8 字节为 "ftyp"
+    if raw[4:8] == b"ftyp":
+        return "video/quicktime" if raw[8:12] == b"qt  " else "video/mp4"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"AVI ":
+        return "video/x-msvideo"
+    return mimetypes.guess_type(fallback_name)[0] or "video/mp4"
+
+
 def image_size(path: str) -> tuple[int, int]:
     """读取本地图片尺寸（用于提交前的合规检查）。"""
     try:
@@ -50,15 +75,102 @@ def image_size(path: str) -> tuple[int, int]:
         raise BailianError(f"无法读取图片 {Path(path).name}：{e}")
 
 
-def to_data_uri(path: str) -> str:
-    """本地图片文件 → data URI（实测 wan2.7-r2v 支持，平台会自动转存到 OSS）。"""
+def to_data_uri(path: str, kind: str = "image") -> str:
+    """本地文件 → data URI（实测 wan2.7-r2v 支持图片和视频，平台会自动转存到 OSS）。"""
     p = Path(path)
-    if p.stat().st_size > MAX_REF_FILE_MB * 1024 * 1024:
-        raise BailianError(f"参考图 {p.name} 超过 {MAX_REF_FILE_MB}MB，请压缩后重试，或改用图片 URL")
+    limit = MAX_REF_IMAGE_MB if kind == "image" else MAX_REF_VIDEO_MB
+    label = REF_LABELS.get(kind, "参考素材")
+    if p.stat().st_size > limit * 1024 * 1024:
+        raise BailianError(
+            f"{label} {p.name} 超过 {limit}MB，请压缩后重试，或改用 URL 形式"
+        )
     raw = p.read_bytes()
-    mime = sniff_image_mime(raw, p.name)
+    sniff = sniff_image_mime if kind == "image" else sniff_video_mime
+    default = "image/png" if kind == "image" else "video/mp4"
+    mime = sniff(raw, p.name) or default
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
+
+
+def collect_refs(m, kind_name: str, files, urls_text) -> tuple[list, str]:
+    """整理某一类参考素材（URL 每行一个 + 本地文件转 base64）。
+
+    返回 (地址列表, 错误信息)；错误信息非空时地址列表无意义。
+    """
+    kind = m.refs.kind(kind_name)
+    label = REF_LABELS[kind_name]
+    files = [f for f in (files or []) if f]
+    urls = [u.strip() for u in (urls_text or "").splitlines() if u.strip()]
+
+    if not kind.enabled:
+        if files or urls:
+            return [], f"「{m.name}」不支持{label}，请清空后再试"
+        return [], ""
+    if len(urls) + len(files) > kind.max:
+        return [], f"{label}最多 {kind.max} 个（当前 {len(urls) + len(files)} 个）"
+    # wan3.0 系列实测只接受 http/https 地址，本地上传的 base64 会被拒绝
+    if files and kind.url_scheme == "http":
+        return [], (f"「{m.name}」的{label}只接受 http/https 地址，不支持本地上传。\n\n"
+                    f"请把 {len(files)} 个本地文件先传到图床，再以 URL 形式粘贴到下方"
+                    f"输入框（每行一个）；或改用「万相2.7 参考生视频」（它支持本地上传）。")
+    try:
+        # 参考图提交前先本地校验尺寸，避免平台返回 InvalidParameter 白跑一趟
+        if kind_name == "image":
+            for f in files:
+                w, h = image_size(f)
+                if min(w, h) < MIN_REF_SIDE:
+                    raise BailianError(
+                        f"参考图 {Path(f).name} 尺寸为 {w}x{h}，平台要求至少 "
+                        f"{MIN_REF_SIDE}x{MIN_REF_SIDE}，请换一张更清晰的图片"
+                    )
+        return urls + [to_data_uri(f, kind_name) for f in files], ""
+    except BailianError as e:
+        return [], str(e)
+
+
+def ref_manifest(m, img_files, img_urls, vid_files, vid_urls) -> str:
+    """列出参考素材的编号对照表。
+
+    提示词用「图1」「视频1」指代素材，编号 = 素材在 media 数组中的顺序；
+    图片与视频分别从 1 开始计数。界面上直接显示，避免用户靠猜。
+    """
+    if not m.ref_enabled:
+        return ""
+
+    def numbered(kind_name: str, files, urls_text) -> list:
+        kind = m.refs.kind(kind_name)
+        if not kind.enabled:
+            return []
+        prefix = REF_PREFIX[kind_name]
+        sources = [Path(f).name for f in (files or []) if f]
+        sources += [u.strip() for u in (urls_text or "").splitlines() if u.strip()]
+        out = []
+        for i, src in enumerate(sources):
+            shown = src if len(src) <= 48 else src[:45] + "…"
+            out.append(f"`{prefix}{i + 1}` = {shown}")
+        return out
+
+    items = numbered("image", img_files, img_urls) + numbered(
+        "video", vid_files, vid_urls
+    )
+    if not items:
+        return ""
+    return (
+        "**素材编号**（写提示词时用这些编号指代，按添加顺序）："
+        + "　".join(items)
+    )
+
+
+def check_totals(m, images: list, videos: list) -> str:
+    """检查素材总数（实测 r2v 的 media 数组上限为 5，图 + 视频合计）。"""
+    total = len(images) + len(videos)
+    if total < m.refs.min_total:
+        return (f"「{m.name}」至少需要 {m.refs.min_total} 个参考素材"
+                "（参考图或参考视频，上传本地文件或粘贴 URL）")
+    if m.refs.max_total and total > m.refs.max_total:
+        return (f"参考素材合计最多 {m.refs.max_total} 个"
+                f"（当前 {len(images)} 张参考图 + {len(videos)} 个参考视频 = {total} 个）")
+    return ""
 
 
 def build_app() -> gr.Blocks:
@@ -84,6 +196,14 @@ def build_app() -> gr.Blocks:
 
     def model_choices() -> list:
         return [(f"{m.name}（{m.id}）", m.id) for m in cfg.models]
+
+    def ref_manifest_for(model_id, img_files, img_urls, vid_files, vid_urls) -> str:
+        """事件回调版：下拉框传来的是模型 id，先解析成 ModelSpec。"""
+        try:
+            m = cfg.get_model(model_id)
+        except KeyError:
+            return ""
+        return ref_manifest(m, img_files, img_urls, vid_files, vid_urls)
 
     def default_model_id() -> str | None:
         ids = [m.id for m in cfg.models]
@@ -165,24 +285,38 @@ def build_app() -> gr.Blocks:
             f"- 分辨率：{sizes}",
         ]
         if m.ref_enabled:
-            req = "**必传**" if m.ref_required else "可选"
-            lines.append(f"- 参考图：{req}，最多 {m.ref_max} 张")
-            if m.ref_url_scheme == "http":
-                lines.append("- ⚠️ 该模型参考图**只支持 http/https 图片地址**，不能用本地上传")
-            else:
-                lines.append("- 参考图支持本地上传或图片 URL")
+            parts = []
+            if m.image_max:
+                parts.append(f"参考图最多 {m.image_max} 张")
+            if m.video_max:
+                parts.append(f"参考视频最多 {m.video_max} 个")
+            if parts:
+                req = "**至少需要 1 个**" if m.refs.min_total else "可选"
+                total = f"，合计最多 {m.ref_total_max} 个" if m.refs.max_total else ""
+                lines.append(f"- 参考素材：{req}（{'；'.join(parts)}{total}）")
+            for name, kind in m.refs.kinds():
+                if not kind.enabled:
+                    continue
+                label = REF_LABELS[name]
+                if kind.url_scheme == "http":
+                    lines.append(f"- ⚠️ {label}**只支持 http/https 地址**，不能用本地上传")
+                else:
+                    lines.append(f"- {label}支持本地上传或 URL")
         return "\n".join(lines)
 
     def model_controls(model_id: str) -> tuple:
         """模型切换时，返回各控件的新状态（与 outputs 顺序一致）。"""
         m = cfg.get_model(model_id)
         size_choices = m.size_options
+        img, vid = m.refs.image, m.refs.video
         return (
             model_info_text(model_id),                                     # model_info
             gr.update(visible=m.supports("negative_prompt")),              # neg_prompt
-            gr.update(visible=m.ref_enabled),                              # ref_group
-            # wan3.0 系列只接受 http(s) 地址，对它们隐藏本地上传控件
-            gr.update(visible=m.ref_enabled and m.ref_url_scheme != "http"),  # ref_files
+            gr.update(visible=m.ref_enabled and img.enabled),              # ref_image_group
+            # wan3.0 系列只接受 http(s) 地址，对它们隐藏本地上传控件（URL 输入框仍保留）
+            gr.update(visible=img.enabled and img.url_scheme != "http"),   # ref_image_files
+            gr.update(visible=m.ref_enabled and vid.enabled),              # ref_video_group
+            gr.update(visible=vid.enabled and vid.url_scheme != "http"),   # ref_video_files
             gr.update(                                                     # duration
                 minimum=m.duration_min,
                 maximum=m.duration_max,
@@ -198,7 +332,9 @@ def build_app() -> gr.Blocks:
 
     # ---------------- 生成主流程 ----------------
 
-    def generate(model_id, prompt, neg, ref_files, ref_urls_text,
+    def generate(model_id, prompt, neg,
+                 ref_image_files, ref_image_urls_text,
+                 ref_video_files, ref_video_urls_text,
                  dur, res, seed_val, p_ext, wm):
         no_change = gr.update()
         # 输出顺序：status_md, video_out, history_df, history_state, resume_input
@@ -215,47 +351,24 @@ def build_app() -> gr.Blocks:
             yield ("❌ 请输入提示词",) + empty_ret[1:]
             return
 
-        # ---- 参考图整理：URL（每行一个）+ 本地文件转 base64 ----
-        urls = [u.strip() for u in (ref_urls_text or "").splitlines() if u.strip()]
-        files = [f for f in (ref_files or []) if f]
-        if m.ref_enabled:
-            if m.ref_required and not (urls or files):
-                yield (f"❌ 「{m.name}」需要至少 1 张参考图"
-                       "（上传本地图片或粘贴图片 URL）",) + empty_ret[1:]
-                return
-            if len(urls) + len(files) > m.ref_max:
-                yield (f"❌ 参考图最多 {m.ref_max} 张"
-                       f"（当前 {len(urls) + len(files)} 张）",) + empty_ret[1:]
-                return
-            # wan3.0 系列实测只接受 http/https 地址，本地上传的 base64 会被拒绝
-            if files and m.ref_url_scheme == "http":
-                yield (f"❌ 「{m.name}」只接受 http/https 图片地址，不支持本地上传。\n\n"
-                       f"请把 {len(files)} 张本地图片先传到图床，再以 URL 形式粘贴到下方输入框"
-                       "（每行一个）；或改用「万相2.7 参考生视频」（它支持本地上传）。",
-                       ) + empty_ret[1:]
-                return
-            try:
-                # 提交前先本地校验图片尺寸，避免平台返回 InvalidParameter 白跑一趟
-                for f in files:
-                    w, h = image_size(f)
-                    if min(w, h) < MIN_REF_SIDE:
-                        raise BailianError(
-                            f"参考图 {Path(f).name} 尺寸为 {w}x{h}，平台要求至少 "
-                            f"{MIN_REF_SIDE}x{MIN_REF_SIDE}，请换一张更清晰的图片"
-                        )
-                refs = urls + [to_data_uri(f) for f in files]
-            except BailianError as e:
-                yield (f"❌ {e}",) + empty_ret[1:]
-                return
-        else:
-            refs = []
+        # ---- 收集参考素材：参考图 + 参考视频，两类可混用 ----
+        images, err = collect_refs(m, "image", ref_image_files, ref_image_urls_text)
+        if not err:
+            videos, err = collect_refs(m, "video", ref_video_files, ref_video_urls_text)
+        if not err:
+            err = check_totals(m, images, videos)
+        if err:
+            yield (f"❌ {err}",) + empty_ret[1:]
+            return
+        total = len(images) + len(videos)
 
         # ---- 组装请求体 ----
         input_payload, parameters = build_payload(
             m,
             prompt=prompt,
             negative_prompt=neg,
-            refs=refs,
+            images=images,
+            videos=videos,
             duration=int(dur),
             size=res,
             seed=seed_val,
@@ -271,7 +384,11 @@ def build_app() -> gr.Blocks:
             "duration": int(dur),
             "resolution": res,
             "parameters": parameters,
-            "ref_count": len(refs),
+            "ref_count": total,
+            "ref_images": len(images),
+            "ref_videos": len(videos),
+            "ref_map": ref_manifest(m, ref_image_files, ref_image_urls_text,
+                                    ref_video_files, ref_video_urls_text),
             # 记录请求体（参考素材内容太长，只存数量），便于失败时排查
             "input_preview": {
                 k: (f"<{len(v)} 个参考素材>" if k == m.ref_param else v)
@@ -512,21 +629,37 @@ def build_app() -> gr.Blocks:
                 model_info = gr.Markdown()
                 prompt = gr.Textbox(
                     label="提示词（描述想要的视频画面）", lines=4,
-                    placeholder="例如：一只小猫在月光下的屋顶上奔跑，城市霓虹灯在远处闪烁，电影级画质",
+                    placeholder=(
+                        "例如：图1中的女孩穿上图2里的红色外套，在城市街头向前走，"
+                        "镜头缓慢推近，电影级画质\n"
+                        "（用了参考素材时，直接用「图1」「图2」「视频1」指代它们即可）"
+                    ),
                 )
                 neg_prompt = gr.Textbox(
                     label="负面提示词（不希望出现的内容）", lines=2, visible=False,
                     placeholder="例如：模糊、变形、低画质",
                 )
-                with gr.Group(visible=False) as ref_group:
-                    gr.Markdown("**参考素材**（用于参考生视频）")
-                    ref_files = gr.File(
-                        label="上传参考图片（可多张）",
+                with gr.Group(visible=False) as ref_image_group:
+                    gr.Markdown("**参考图**（锁定主体外观：人物 / 角色 / 产品）")
+                    ref_image_files = gr.File(
+                        label="上传参考图（可多张，按顺序编号为 图1、图2…）",
                         file_count="multiple", file_types=["image"],
                     )
-                    ref_urls = gr.Textbox(
-                        label="或粘贴参考图片 URL（每行一个，可与本地图片混用）", lines=2,
+                    ref_image_urls = gr.Textbox(
+                        label="或粘贴参考图 URL（每行一个，可与本地图片混用；接在本地图之后编号）",
+                        lines=2,
                     )
+                with gr.Group(visible=False) as ref_video_group:
+                    gr.Markdown("**参考视频**（参考动作 / 镜头运动 / 风格）")
+                    ref_video_files = gr.File(
+                        label="上传参考视频（可多个，按顺序编号为 视频1、视频2…）",
+                        file_count="multiple", file_types=["video"],
+                    )
+                    ref_video_urls = gr.Textbox(
+                        label="或粘贴参考视频 URL（每行一个，可与本地视频混用；接在本地视频之后编号）",
+                        lines=2,
+                    )
+                ref_manifest_md = gr.Markdown()
                 duration = gr.Slider(minimum=2, maximum=15, step=1, value=5, label="视频时长")
                 resolution = gr.Dropdown(choices=[], value=None, label="分辨率")
                 with gr.Accordion("高级参数", open=False):
@@ -570,16 +703,26 @@ def build_app() -> gr.Blocks:
 
         model_dd.change(
             fn=model_controls, inputs=[model_dd],
-            outputs=[model_info, neg_prompt, ref_group, ref_files,
+            outputs=[model_info, neg_prompt,
+                     ref_image_group, ref_image_files,
+                     ref_video_group, ref_video_files,
                      duration, resolution, cost_md],
         )
         duration.change(
             fn=lambda mid, d: cost_text(mid, d),
             inputs=[model_dd, duration], outputs=[cost_md],
         )
+        # 素材编号对照：换模型或增删素材时实时刷新，用户照抄提示词里的「图1」「视频1」
+        ref_inputs = [model_dd, ref_image_files, ref_image_urls,
+                      ref_video_files, ref_video_urls]
+        for comp in ref_inputs:
+            comp.change(fn=ref_manifest_for, inputs=ref_inputs,
+                        outputs=[ref_manifest_md])
         gen_btn.click(
             fn=generate,
-            inputs=[model_dd, prompt, neg_prompt, ref_files, ref_urls,
+            inputs=[model_dd, prompt, neg_prompt,
+                    ref_image_files, ref_image_urls,
+                    ref_video_files, ref_video_urls,
                     duration, resolution, seed, prompt_extend, watermark],
             outputs=[status_md, video_out, history_df, history_state, resume_input],
         )
@@ -604,8 +747,10 @@ def build_app() -> gr.Blocks:
 
         demo.load(
             fn=_initial_load,
-            outputs=[model_info, neg_prompt, ref_group, ref_files, duration,
-                     resolution, cost_md, history_df, history_state],
+            outputs=[model_info, neg_prompt,
+                     ref_image_group, ref_image_files,
+                     ref_video_group, ref_video_files,
+                     duration, resolution, cost_md, history_df, history_state],
         )
 
     return demo

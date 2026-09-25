@@ -32,15 +32,22 @@ defaults:
 #   duration      支持的时长范围（秒）
 #   size_param    分辨率参数名（wan2.7-t2v 用 size，其余多用 resolution）
 #   size_options  分辨率选项 [显示名, 传给API的值]
-#   ref_images    参考图配置：
-#                 enabled  是否支持 / required 是否必传 / max 最大张数
-#                 param    API 字段名（实测为 media）
-#                 item_type  media 元素的 type 取值，实测合法值只有三个：
-#                            reference_image（参考图）/ reference_video（参考视频）/ first_frame（首帧）
-#                 url_scheme any=支持本地上传(自动转 base64) / http=只接受 http(s) 图片地址
-#                 ※ 这些值均为 2026-09-24 实测平台的校验报错得出；若平台调整，改这里即可，无需改代码
+#   refs          参考素材配置（参考图 + 参考视频）：
+#                 enabled    是否支持参考素材
+#                 param      API 字段名（实测为 media）
+#                 min_total  至少要几个素材；0 = 可有可无
+#                 max_total  media 数组总长度上限；0 = 不限（只按下面分类上限约束）
+#                 image/video  两类素材各自的配置：
+#                     enabled     该类是否可用
+#                     max         该类最多几个
+#                     item_type   media 元素的 type 取值（实测只有三个合法值：
+#                                 reference_image / reference_video / first_frame）
+#                     url_scheme  any = 支持本地上传(自动转 base64) / http = 只接受 http(s) 地址
 #   extra_params  该模型支持的额外参数（negative_prompt / seed / prompt_extend / watermark）
 #   price_per_second  每秒单价（元），填数字后界面会显示费用预估；null 表示不显示
+#
+# ※ 以上 refs 取值均为 2026-09-24 直接探测平台校验报错得出，实测结论见 README。
+#   若平台调整，改这里即可，无需改代码。
 # ------------------------------------------------------------
 models:
   - id: "wan2.7-t2v-2026-06-12"
@@ -51,20 +58,25 @@ models:
     size_options:
       - ["720P (1280*720)", "1280*720"]
       - ["1080P (1920*1080)", "1920*1080"]
-    ref_images: { enabled: false, required: false, max: 0, param: "media" }
+    refs: { enabled: false }   # 实测：t2v 不接受 media 字段（会被忽略）
     extra_params: ["negative_prompt", "seed", "prompt_extend", "watermark"]
     price_per_second: null
 
   - id: "wan2.7-r2v-2026-06-12"
     name: "万相2.7 参考生视频"
-    description: "上传 1~5 张主体参考图（人物/角色/产品），生成时锁定主体外观与特征。"
+    description: "上传主体参考图（人物/角色/产品）或参考视频，生成时锁定主体外观与动作特征。"
     duration: { min: 2, max: 15, default: 5 }
     size_param: "resolution"
     size_options:
       - ["720P", "720P"]
       - ["1080P", "1080P"]
-    # 实测：平台支持本地上传（base64 会由平台自动转存到 OSS）
-    ref_images: { enabled: true, required: true, max: 5, param: "media", item_type: "reference_image", url_scheme: "any" }
+    refs:
+      enabled: true
+      param: "media"
+      min_total: 1     # 实测：至少要有 1 个素材（只给视频也行——单独 reference_video 能通过校验）
+      max_total: 5     # 实测：media 数组最多 5 项（图 + 视频合计，超了报 "Media array is too long"）
+      image: { enabled: true, max: 5, item_type: "reference_image", url_scheme: "any" }
+      video: { enabled: true, max: 5, item_type: "reference_video", url_scheme: "any" }
     extra_params: ["prompt_extend", "watermark"]
     price_per_second: null
 
@@ -77,8 +89,13 @@ models:
       - ["480P", "480P"]
       - ["720P", "720P"]
       - ["1080P", "1080P"]
-    # 实测：只接受 http/https 图片地址，不支持本地上传（base64）
-    ref_images: { enabled: true, required: false, max: 10, param: "media", item_type: "reference_image", url_scheme: "http" }
+    refs:
+      enabled: true
+      param: "media"
+      min_total: 0
+      max_total: 15    # 实测：两类分别计数（10 图 + 5 视频），故总上限取两者之和
+      image: { enabled: true, max: 10, item_type: "reference_image", url_scheme: "http" }
+      video: { enabled: true, max: 5, item_type: "reference_video", url_scheme: "http" }
     extra_params: ["prompt_extend", "watermark"]
     price_per_second: null
 
@@ -91,7 +108,12 @@ models:
       - ["480P", "480P"]
       - ["720P", "720P"]
       - ["1080P", "1080P"]
-    # 实测：只接受 http/https 图片地址，不支持本地上传（base64）
-    ref_images: { enabled: true, required: false, max: 10, param: "media", item_type: "reference_image", url_scheme: "http" }
+    refs:
+      enabled: true
+      param: "media"
+      min_total: 0
+      max_total: 15
+      image: { enabled: true, max: 10, item_type: "reference_image", url_scheme: "http" }
+      video: { enabled: true, max: 5, item_type: "reference_video", url_scheme: "http" }
     extra_params: ["prompt_extend", "watermark"]
     price_per_second: null
