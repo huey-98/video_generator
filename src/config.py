@@ -22,6 +22,7 @@ class AppConfig:
     poll_interval: int
     task_timeout: int
     download_timeout: int
+    upload_timeout: int
     output_dir: Path
     default_model: str
     defaults: dict = field(default_factory=dict)
@@ -47,6 +48,7 @@ def load_app_config() -> AppConfig:
         poll_interval=int(api.get("poll_interval", 5)),
         task_timeout=int(api.get("task_timeout", 900)),
         download_timeout=int(api.get("download_timeout", 300)),
+        upload_timeout=int(api.get("upload_timeout", 300)),
         output_dir=ROOT_DIR / (raw.get("output_dir") or "outputs"),
         default_model=(raw.get("defaults") or {}).get("model", ""),
         defaults=raw.get("defaults") or {},

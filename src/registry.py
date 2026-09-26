@@ -22,15 +22,20 @@ class RefKind:
     enabled: bool = False
     max: int = 0
     item_type: str = ""           # media 元素的 type 取值
-    url_scheme: str = "any"       # any=支持本地上传(base64)；http=只接受 http(s) 地址
+    # 本地文件怎么变成平台能用的地址：
+    #   base64 = 直接内联（data:...;base64,...），体积会放大 1/3
+    #   oss    = 先上传到百炼临时空间换成 oss:// 临时URL（48 小时有效），平台不收 base64 时用
+    upload_mode: str = "base64"
 
     @classmethod
     def from_dict(cls, d: dict, kind: str) -> "RefKind":
+        # 兼容旧字段名 url_scheme（any → base64；http → oss）
+        legacy = {"any": "base64", "http": "oss"}.get(d.get("url_scheme", ""), "")
         return cls(
             enabled=bool(d.get("enabled", False)),
             max=int(d.get("max", 0)),
             item_type=d.get("item_type") or ITEM_TYPES.get(kind, ""),
-            url_scheme=d.get("url_scheme", "any"),
+            upload_mode=d.get("upload_mode") or legacy or "base64",
         )
 
 
@@ -54,8 +59,8 @@ class RefSpec:
 
     @property
     def local_upload_kinds(self) -> list:
-        """支持本地上传（base64）的素材类别。"""
-        return [n for n, k in self.kinds() if k.enabled and k.url_scheme != "http"]
+        """支持本地上传的素材类别（两种模式都算：base64 内联或上传换临时URL）。"""
+        return [n for n, k in self.kinds() if k.enabled]
 
     @classmethod
     def from_dict(cls, d: dict) -> "RefSpec":

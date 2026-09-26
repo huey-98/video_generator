@@ -11,7 +11,7 @@ from pathlib import Path
 # 保证可以 import src / ui（无论从哪个目录启动）
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ui.webui import build_app
+from ui.webui import CUSTOM_CSS, build_app
 
 
 def silence_windows_proactor_noise() -> None:
@@ -52,7 +52,13 @@ def main():
 
     app = build_app()
     app.queue()  # 排队机制：生成任务耗时长，避免并发冲突
-    app.launch(server_name="127.0.0.1", server_port=port, inbrowser=not no_browser)
+    app.launch(
+        server_name="127.0.0.1",
+        server_port=port,
+        inbrowser=not no_browser,
+        # Gradio 6 起 css 必须传给 launch()，传给 Blocks() 会被静默忽略
+        css=CUSTOM_CSS,
+    )
 
 
 if __name__ == "__main__":

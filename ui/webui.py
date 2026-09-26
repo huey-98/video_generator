@@ -15,8 +15,11 @@ from src.client import BailianClient, BailianError
 from src.config import load_app_config
 from src.payload import build_payload
 
-MAX_REF_IMAGE_MB = 8   # 单个参考图文件大小上限（base64 内联会放大体积，超限建议改用 URL）
-MAX_REF_VIDEO_MB = 30  # 单个参考视频文件大小上限（本地保护性上限，非平台实测值）
+MAX_REF_IMAGE_MB = 8   # base64 路径的参考图大小上限（内联会放大 1/3 体积，超限建议用 URL 或上传）
+MAX_REF_VIDEO_MB = 30  # base64 路径的参考视频大小上限（本地保护性上限，非平台实测值）
+# 上传到百炼临时空间时的上限（平台值，比 base64 路径宽松——文件本身不经 base64 放大）
+MAX_UPLOAD_IMAGE_MB = 20    # 平台：参考图 ≤20MB
+MAX_UPLOAD_VIDEO_MB = 100   # 平台：参考视频 ≤100MB
 MIN_REF_SIDE = 240     # 平台要求参考图至少 240x240（实测报错：resolution must be at least 240x240）
 POLL_MAX_ERRORS = 5    # 轮询时允许的连续网络错误次数
 
@@ -26,6 +29,67 @@ REF_LABELS = {"image": "参考图", "video": "参考视频"}
 
 # 提示词中引用参考素材的编号前缀（实测各类素材分别计数，序号互不占用）
 REF_PREFIX = {"image": "图", "video": "视频"}
+
+# ------------------------------------------------------------
+# 自定义样式
+#   .ref-uploader : 隐藏 Gradio 自带的文件名列表，列表职责交给缩略图
+#   .ref-thumbs   : 缩略图网格，强制小尺寸
+#   .ref-dock     : 右下角悬浮预览窗，点击缩略图后在这里显示原图/原视频
+#
+# ※ Gradio 6 起 css 必须传给 launch()，传给 Blocks() 会被静默忽略（只发一条警告），
+#   因此这里导出 CUSTOM_CSS 由 main.py 在 launch 时传入。
+# ------------------------------------------------------------
+CUSTOM_CSS = """
+.ref-uploader .file-preview-holder { display: none !important; }
+
+/* 强制格子尺寸：Gradio 默认最小 160px 且会把少量图片拉伸铺满整行，
+   用 auto-fill + minmax 固定成小方格子，才是真正的缩略图 */
+.ref-thumbs .grid-container {
+    grid-template-columns: repeat(auto-fill, minmax(96px, 96px)) !important;
+    gap: 6px !important;
+    justify-content: start !important;
+}
+.ref-thumbs .thumbnail-item {
+    max-height: 104px !important;
+    border-radius: 6px;
+}
+.ref-thumbs .thumbnail-item img,
+.ref-thumbs .thumbnail-item video {
+    max-height: 104px !important;
+    object-fit: contain !important;
+}
+
+/* 右下角悬浮窗：position:fixed 保证滚动时停在原位，不随页面移动 */
+.ref-dock {
+    position: fixed !important;
+    right: 18px !important;
+    bottom: 18px !important;
+    left: auto !important;
+    top: auto !important;
+    width: min(46vw, 640px);
+    z-index: 1000;
+    background: var(--body-background-fill, #ffffff);
+    border: 1px solid var(--border-color-primary, #d0d0d0);
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.24);
+    padding: 6px 10px 10px;
+}
+/* 兜底：万一 Gradio 内部结构变化，也不让媒体撑破窗口 */
+.ref-dock img,
+.ref-dock video {
+    max-width: 100% !important;
+    object-fit: contain !important;
+}
+.ref-dock .ref-dock-head {
+    align-items: center !important;
+    gap: 8px !important;
+}
+.ref-dock .ref-dock-close {
+    min-width: 34px !important;
+    max-width: 34px !important;
+    flex: none !important;
+}
+"""
 
 
 # 图片魔数 → MIME，平台会按内容判断文件类型，用魔数比扩展名可靠
@@ -92,10 +156,14 @@ def to_data_uri(path: str, kind: str = "image") -> str:
     return f"data:{mime};base64,{b64}"
 
 
-def collect_refs(m, kind_name: str, files, urls_text) -> tuple[list, str]:
-    """整理某一类参考素材（URL 每行一个 + 本地文件转 base64）。
+def collect_refs(m, kind_name: str, files, urls_text, upload_fn=None) -> tuple[list, str]:
+    """整理某一类参考素材（本地文件 + URL 每行一个），返回 (地址列表, 错误信息)。
 
-    返回 (地址列表, 错误信息)；错误信息非空时地址列表无意义。
+    本地文件怎么变成平台可用的地址，取决于模型的 upload_mode：
+        base64 → 直接内联 data URI（wan2.7-r2v 实测支持）
+        oss    → 用 upload_fn 上传到百炼临时空间换 oss:// 临时URL（wan3.0 系列不收 base64）
+
+    地址顺序 = **本地文件在前、URL 在后**，与界面上 ref_manifest 显示的编号一致。
     """
     kind = m.refs.kind(kind_name)
     label = REF_LABELS[kind_name]
@@ -108,22 +176,26 @@ def collect_refs(m, kind_name: str, files, urls_text) -> tuple[list, str]:
         return [], ""
     if len(urls) + len(files) > kind.max:
         return [], f"{label}最多 {kind.max} 个（当前 {len(urls) + len(files)} 个）"
-    # wan3.0 系列实测只接受 http/https 地址，本地上传的 base64 会被拒绝
-    if files and kind.url_scheme == "http":
-        return [], (f"「{m.name}」的{label}只接受 http/https 地址，不支持本地上传。\n\n"
-                    f"请把 {len(files)} 个本地文件先传到图床，再以 URL 形式粘贴到下方"
-                    f"输入框（每行一个）；或改用「万相2.7 参考生视频」（它支持本地上传）。")
+    if files and kind.upload_mode == "oss" and upload_fn is None:
+        return [], (f"「{m.name}」的{label}不接受 base64，本地文件必须先上传换取临时 URL，"
+                    f"但当前无法连接百炼（请检查 API Key 配置）")
     try:
-        # 参考图提交前先本地校验尺寸，避免平台返回 InvalidParameter 白跑一趟
-        if kind_name == "image":
-            for f in files:
-                w, h = image_size(f)
-                if min(w, h) < MIN_REF_SIDE:
-                    raise BailianError(
-                        f"参考图 {Path(f).name} 尺寸为 {w}x{h}，平台要求至少 "
-                        f"{MIN_REF_SIDE}x{MIN_REF_SIDE}，请换一张更清晰的图片"
-                    )
-        return urls + [to_data_uri(f, kind_name) for f in files], ""
+        local_urls: list = []
+        if files:
+            # 参考图提交前先本地校验尺寸，避免平台返回 InvalidParameter 白跑一趟
+            if kind_name == "image":
+                for f in files:
+                    w, h = image_size(f)
+                    if min(w, h) < MIN_REF_SIDE:
+                        raise BailianError(
+                            f"参考图 {Path(f).name} 尺寸为 {w}x{h}，平台要求至少 "
+                            f"{MIN_REF_SIDE}x{MIN_REF_SIDE}，请换一张更清晰的图片"
+                        )
+            if kind.upload_mode == "oss":
+                local_urls = [upload_fn(f, kind_name) for f in files]
+            else:
+                local_urls = [to_data_uri(f, kind_name) for f in files]
+        return local_urls + urls, ""
     except BailianError as e:
         return [], str(e)
 
@@ -159,6 +231,60 @@ def ref_manifest(m, img_files, img_urls, vid_files, vid_urls) -> str:
         "**素材编号**（写提示词时用这些编号指代，按添加顺序）："
         + "　".join(items)
     )
+
+
+def ref_file_label(m, kind_name: str) -> str:
+    """本地文件上传框的标签：oss 模式下额外提示要换成临时 URL。"""
+    kind = m.refs.kind(kind_name)
+    prefix = REF_PREFIX[kind_name]
+    unit = "张" if kind_name == "image" else "个"
+    label = f"上传{REF_LABELS[kind_name]}（可多{unit}，按顺序编号为 {prefix}1、{prefix}2…）"
+    if kind.upload_mode == "oss":
+        label += "——选好后点下方「📤 上传换取临时URL」"
+    return label
+
+
+def make_dock_handler(kind_name: str):
+    """点击缩略图 → 在右下角悬浮窗显示原图/原视频。
+
+    窗口尺寸由 CSS 限死（position:fixed + 原生 height 参数），
+    图片或视频超出窗口时自动等比缩小，保证完整显示、不裁切。
+
+    返回顺序与 outputs 一致：[悬浮窗, 图片, 视频, 标题]
+    """
+    is_image = kind_name == "image"
+
+    def handler(files, evt: gr.SelectData):
+        paths = [x for x in (files or []) if x]
+        idx = evt.index
+        if isinstance(idx, (list, tuple)):   # 不同 Gradio 版本可能是元组
+            idx = idx[0] if idx else None
+        if idx is None or not (0 <= idx < len(paths)):
+            return gr.update(), gr.update(), gr.update(), gr.update()
+        path = paths[idx]
+        title = (f"**原图** · {Path(path).name}" if is_image
+                 else f"**参考视频** · {Path(path).name}")
+        return (
+            gr.update(visible=True),                                       # 悬浮窗
+            gr.update(value=path if is_image else None, visible=is_image),
+            gr.update(value=None if is_image else path, visible=not is_image),
+            title,
+        )
+
+    return handler
+
+
+def ref_gallery(kind_name: str, files) -> list:
+    """把选中的本地文件整理成带编号的预览项 [(文件路径, 说明), ...]。
+
+    编号用「图1」「视频1」这种前缀，与 ref_manifest 的编号表一致，
+    这样预览里看到的就是提示词里该写的那个编号。
+    """
+    prefix = REF_PREFIX[kind_name]
+    return [
+        (f, f"{prefix}{i} · {Path(f).name}")
+        for i, f in enumerate([x for x in (files or []) if x], 1)
+    ]
 
 
 def check_totals(m, images: list, videos: list) -> str:
@@ -298,25 +424,115 @@ def build_app() -> gr.Blocks:
                 if not kind.enabled:
                     continue
                 label = REF_LABELS[name]
-                if kind.url_scheme == "http":
-                    lines.append(f"- ⚠️ {label}**只支持 http/https 地址**，不能用本地上传")
+                if kind.upload_mode == "oss":
+                    lines.append(f"- 📤 {label}：选本地文件后点「上传换取临时URL」"
+                                 f"（48 小时有效），也可直接粘贴公网 URL")
                 else:
                     lines.append(f"- {label}支持本地上传或 URL")
         return "\n".join(lines)
+
+    # ---------------- 本地文件 → 临时URL ----------------
+
+    def make_uploader(m):
+        """返回「本地文件 → oss:// 临时URL」的函数。
+
+        上传时指定的模型必须与后续调用模型一致（平台规则），所以固定用 m.id。
+        每次上传都重新取凭证，upload_dir 带新 UUID，因此同名文件不会互相覆盖。
+        """
+        def _upload(path, kind_name: str) -> str:
+            client = get_client()
+            p = Path(path)
+            limit = MAX_UPLOAD_IMAGE_MB if kind_name == "image" else MAX_UPLOAD_VIDEO_MB
+            size_mb = p.stat().st_size / 1048576
+            if size_mb > limit:
+                raise BailianError(
+                    f"{REF_LABELS[kind_name]} {p.name} 为 {size_mb:.1f}MB，"
+                    f"超过平台上限 {limit}MB，请压缩后重试"
+                )
+            with open(p, "rb") as f:
+                head = f.read(32)   # 只需文件头即可嗅探类型，不必把整份文件读进内存
+            sniff = sniff_image_mime if kind_name == "image" else sniff_video_mime
+            return client.upload_file(p, m.id, sniff(head, p.name))
+
+        return _upload
+
+    def upload_refs_for(model_id, kind_name, files, urls_text):
+        """「📤 上传换取临时URL」按钮：上传选中的本地文件，地址追加进 URL 输入框。"""
+        label = REF_LABELS[kind_name]
+        no_change = gr.update()
+        try:
+            m = cfg.get_model(model_id)
+        except KeyError as e:
+            yield no_change, no_change, f"❌ {e}"
+            return
+
+        files = [f for f in (files or []) if f]
+        if not files:
+            yield no_change, no_change, f"⚠️ 请先选择要上传的{label}文件"
+            return
+        kind = m.refs.kind(kind_name)
+        if len(files) > kind.max:
+            yield no_change, no_change, f"❌ {label}最多 {kind.max} 个（当前 {len(files)} 个）"
+            return
+
+        uploader = make_uploader(m)
+        existing = [u.strip() for u in (urls_text or "").splitlines() if u.strip()]
+        uploaded: list = []
+        for i, f in enumerate(files, 1):
+            yield (no_change, no_change,
+                   f"📤 正在上传{label} {i}/{len(files)}：`{Path(f).name}`…")
+            try:
+                uploaded.append(uploader(f, kind_name))
+            except BailianError as e:
+                yield no_change, no_change, f"❌ {e}"
+                return
+
+        # 上传完就把本地文件从上传区移除、只留 URL，编号才不会错乱
+        yield ("\n".join(existing + uploaded), None,
+               f"✅ 已上传 {len(uploaded)} 个{label}，临时 URL 已填入下方输入框"
+               f"（**48 小时内有效**，请尽快生成）。\n\n"
+               f"文件已从上传区移除，直接点「🚀 开始生成」即可。")
+
+    def make_upload_handler(kind_name: str):
+        """给上传按钮绑定固定的素材类别（回调不好传常量，用闭包包一层）。"""
+        def handler(model_id, files, urls_text):
+            yield from upload_refs_for(model_id, kind_name, files, urls_text)
+
+        return handler
+
+    # ---------------- 本地文件预览 ----------------
+
+    def ref_preview(kind_name: str, files):
+        """刷新预览画廊；没有文件时整体隐藏，不占版面。"""
+        items = ref_gallery(kind_name, files)
+        return gr.update(value=items, visible=bool(items))
+
+    def make_preview_handler(kind_name: str):
+        def handler(files):
+            return ref_preview(kind_name, files)
+
+        return handler
 
     def model_controls(model_id: str) -> tuple:
         """模型切换时，返回各控件的新状态（与 outputs 顺序一致）。"""
         m = cfg.get_model(model_id)
         size_choices = m.size_options
         img, vid = m.refs.image, m.refs.video
+        img_on, vid_on = m.ref_enabled and img.enabled, m.ref_enabled and vid.enabled
         return (
             model_info_text(model_id),                                     # model_info
             gr.update(visible=m.supports("negative_prompt")),              # neg_prompt
-            gr.update(visible=m.ref_enabled and img.enabled),              # ref_image_group
-            # wan3.0 系列只接受 http(s) 地址，对它们隐藏本地上传控件（URL 输入框仍保留）
-            gr.update(visible=img.enabled and img.url_scheme != "http"),   # ref_image_files
-            gr.update(visible=m.ref_enabled and vid.enabled),              # ref_video_group
-            gr.update(visible=vid.enabled and vid.url_scheme != "http"),   # ref_video_files
+            gr.update(visible=img_on),                                     # ref_image_group
+            gr.update(                                                     # ref_image_files
+                visible=img_on, label=ref_file_label(m, "image"),
+            ),
+            # 「上传换临时URL」按钮只在 oss 模式的模型（wan3.0 系列）下出现
+            gr.update(visible=img_on and img.upload_mode == "oss"),        # ref_image_upload_btn
+            gr.update(visible=vid_on),                                     # ref_video_group
+            gr.update(                                                     # ref_video_files
+                visible=vid_on, label=ref_file_label(m, "video"),
+            ),
+            gr.update(visible=vid_on and vid.upload_mode == "oss"),        # ref_video_upload_btn
             gr.update(                                                     # duration
                 minimum=m.duration_min,
                 maximum=m.duration_max,
@@ -328,6 +544,7 @@ def build_app() -> gr.Blocks:
                 value=size_choices[0][1] if size_choices else None,
             ),
             cost_text(model_id, m.duration_default),                       # cost_md
+            "",                                                            # ref_msg_md
         )
 
     # ---------------- 生成主流程 ----------------
@@ -352,9 +569,24 @@ def build_app() -> gr.Blocks:
             return
 
         # ---- 收集参考素材：参考图 + 参考视频，两类可混用 ----
-        images, err = collect_refs(m, "image", ref_image_files, ref_image_urls_text)
+        # 本地文件若走 oss 模式（wan3.0 系列），提交前要自动上传换临时 URL，
+        # 先提示一句——上传一个几十 MB 的视频可能要数秒到数十秒
+        uploading = [
+            REF_LABELS[name]
+            for name, fs in (("image", ref_image_files), ("video", ref_video_files))
+            if m.refs.kind(name).enabled
+            and m.refs.kind(name).upload_mode == "oss"
+            and any(fs or [])
+        ]
+        if uploading:
+            yield (f"📤 正在上传{'、'.join(uploading)}到百炼临时空间"
+                   f"（换取 48 小时有效的临时 URL）…",
+                   None, no_change, no_change, no_change)
+
+        upload_fn = make_uploader(m)
+        images, err = collect_refs(m, "image", ref_image_files, ref_image_urls_text, upload_fn)
         if not err:
-            videos, err = collect_refs(m, "video", ref_video_files, ref_video_urls_text)
+            videos, err = collect_refs(m, "video", ref_video_files, ref_video_urls_text, upload_fn)
         if not err:
             err = check_totals(m, images, videos)
         if err:
@@ -644,6 +876,16 @@ def build_app() -> gr.Blocks:
                     ref_image_files = gr.File(
                         label="上传参考图（可多张，按顺序编号为 图1、图2…）",
                         file_count="multiple", file_types=["image"],
+                        elem_classes=["ref-uploader"],
+                    )
+                    ref_image_upload_btn = gr.Button(
+                        "📤 上传换取临时URL", visible=False, size="sm",
+                    )
+                    ref_image_preview = gr.Gallery(
+                        label="参考图（点缩略图看原图）",
+                        visible=False, columns=8, min_width=72,
+                        object_fit="contain", allow_preview=False,
+                        elem_classes=["ref-thumbs"],
                     )
                     ref_image_urls = gr.Textbox(
                         label="或粘贴参考图 URL（每行一个，可与本地图片混用；接在本地图之后编号）",
@@ -654,12 +896,23 @@ def build_app() -> gr.Blocks:
                     ref_video_files = gr.File(
                         label="上传参考视频（可多个，按顺序编号为 视频1、视频2…）",
                         file_count="multiple", file_types=["video"],
+                        elem_classes=["ref-uploader"],
+                    )
+                    ref_video_upload_btn = gr.Button(
+                        "📤 上传换取临时URL", visible=False, size="sm",
+                    )
+                    ref_video_preview = gr.Gallery(
+                        label="参考视频（点缩略图在右下角播放）",
+                        visible=False, columns=6, min_width=88,
+                        object_fit="contain", allow_preview=False,
+                        elem_classes=["ref-thumbs"],
                     )
                     ref_video_urls = gr.Textbox(
                         label="或粘贴参考视频 URL（每行一个，可与本地视频混用；接在本地视频之后编号）",
                         lines=2,
                     )
                 ref_manifest_md = gr.Markdown()
+                ref_msg_md = gr.Markdown()
                 duration = gr.Slider(minimum=2, maximum=15, step=1, value=5, label="视频时长")
                 resolution = gr.Dropdown(choices=[], value=None, label="分辨率")
                 with gr.Accordion("高级参数", open=False):
@@ -699,14 +952,35 @@ def build_app() -> gr.Blocks:
                 resume_btn = gr.Button("查询状态", scale=1)
                 resume_recent_btn = gr.Button("载入最近未完成任务", scale=1)
 
+        # ---------------- 右下角悬浮预览窗 ----------------
+        # 放在最外层（不嵌进任何 Group），靠 position:fixed 浮在浏览器右下角
+        with gr.Column(elem_classes=["ref-dock"], visible=False) as ref_dock:
+            with gr.Row(elem_classes=["ref-dock-head"]):
+                ref_dock_title = gr.Markdown("")
+                ref_dock_close = gr.Button(
+                    "✕", size="sm", elem_classes=["ref-dock-close"],
+                )
+            # 高度交给 Gradio 原生参数控制（比 CSS 猜内部 DOM 可靠），
+            # 超出窗口时 Gradio 会自动等比缩放到窗口内，保证完整显示
+            ref_dock_image = gr.Image(
+                show_label=False, interactive=False, visible=False,
+                height="44vh",
+                elem_classes=["ref-dock-media"],
+            )
+            ref_dock_video = gr.Video(
+                show_label=False, interactive=False, visible=False,
+                height="44vh",
+                elem_classes=["ref-dock-media"],
+            )
+
         # ---------------- 事件绑定 ----------------
 
         model_dd.change(
             fn=model_controls, inputs=[model_dd],
             outputs=[model_info, neg_prompt,
-                     ref_image_group, ref_image_files,
-                     ref_video_group, ref_video_files,
-                     duration, resolution, cost_md],
+                     ref_image_group, ref_image_files, ref_image_upload_btn,
+                     ref_video_group, ref_video_files, ref_video_upload_btn,
+                     duration, resolution, cost_md, ref_msg_md],
         )
         duration.change(
             fn=lambda mid, d: cost_text(mid, d),
@@ -718,6 +992,38 @@ def build_app() -> gr.Blocks:
         for comp in ref_inputs:
             comp.change(fn=ref_manifest_for, inputs=ref_inputs,
                         outputs=[ref_manifest_md])
+        # 本地文件 → 临时URL（仅 oss 模式的模型显示这两个按钮）
+        ref_image_upload_btn.click(
+            fn=make_upload_handler("image"),
+            inputs=[model_dd, ref_image_files, ref_image_urls],
+            outputs=[ref_image_urls, ref_image_files, ref_msg_md],
+        )
+        ref_video_upload_btn.click(
+            fn=make_upload_handler("video"),
+            inputs=[model_dd, ref_video_files, ref_video_urls],
+            outputs=[ref_video_urls, ref_video_files, ref_msg_md],
+        )
+        # 本地文件预览：选好文件就能看到画面和编号，不用猜自己传了哪几张
+        ref_image_files.change(
+            fn=make_preview_handler("image"), inputs=[ref_image_files],
+            outputs=[ref_image_preview],
+        )
+        ref_video_files.change(
+            fn=make_preview_handler("video"), inputs=[ref_video_files],
+            outputs=[ref_video_preview],
+        )
+        # 点缩略图 → 右下角悬浮窗看原图 / 播放原视频
+        for gallery, files_comp, kind_name in (
+            (ref_image_preview, ref_image_files, "image"),
+            (ref_video_preview, ref_video_files, "video"),
+        ):
+            gallery.select(
+                fn=make_dock_handler(kind_name), inputs=[files_comp],
+                outputs=[ref_dock, ref_dock_image, ref_dock_video, ref_dock_title],
+            )
+        ref_dock_close.click(
+            fn=lambda: gr.update(visible=False), outputs=[ref_dock],
+        )
         gen_btn.click(
             fn=generate,
             inputs=[model_dd, prompt, neg_prompt,
@@ -748,9 +1054,10 @@ def build_app() -> gr.Blocks:
         demo.load(
             fn=_initial_load,
             outputs=[model_info, neg_prompt,
-                     ref_image_group, ref_image_files,
-                     ref_video_group, ref_video_files,
-                     duration, resolution, cost_md, history_df, history_state],
+                     ref_image_group, ref_image_files, ref_image_upload_btn,
+                     ref_video_group, ref_video_files, ref_video_upload_btn,
+                     duration, resolution, cost_md, ref_msg_md,
+                     history_df, history_state],
         )
 
     return demo
