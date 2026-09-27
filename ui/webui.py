@@ -140,7 +140,7 @@ def image_size(path: str) -> tuple[int, int]:
 
 
 def to_data_uri(path: str, kind: str = "image") -> str:
-    """本地文件 → data URI（实测 wan2.7-r2v 支持图片和视频，平台会自动转存到 OSS）。"""
+    """本地文件 → data URI（base64 备用路径：实测 wan2.7-r2v 支持，当前默认不走这里）。"""
     p = Path(path)
     limit = MAX_REF_IMAGE_MB if kind == "image" else MAX_REF_VIDEO_MB
     label = REF_LABELS.get(kind, "参考素材")
@@ -160,8 +160,8 @@ def collect_refs(m, kind_name: str, files, urls_text, upload_fn=None) -> tuple[l
     """整理某一类参考素材（本地文件 + URL 每行一个），返回 (地址列表, 错误信息)。
 
     本地文件怎么变成平台可用的地址，取决于模型的 upload_mode：
-        base64 → 直接内联 data URI（wan2.7-r2v 实测支持）
-        oss    → 用 upload_fn 上传到百炼临时空间换 oss:// 临时URL（wan3.0 系列不收 base64）
+        oss    → 用 upload_fn 上传到百炼临时空间换 oss:// 临时URL（当前所有模型统一走这里）
+        base64 → 直接内联 data URI（备用路径，wan2.7-r2v 实测支持，可在 config.yaml 切回）
 
     地址顺序 = **本地文件在前、URL 在后**，与界面上 ref_manifest 显示的编号一致。
     """
@@ -234,13 +234,13 @@ def ref_manifest(m, img_files, img_urls, vid_files, vid_urls) -> str:
 
 
 def ref_file_label(m, kind_name: str) -> str:
-    """本地文件上传框的标签：oss 模式下额外提示要换成临时 URL。"""
+    """本地文件上传框的标签：oss 模式下说明文件会先换成临时 URL。"""
     kind = m.refs.kind(kind_name)
     prefix = REF_PREFIX[kind_name]
     unit = "张" if kind_name == "image" else "个"
     label = f"上传{REF_LABELS[kind_name]}（可多{unit}，按顺序编号为 {prefix}1、{prefix}2…）"
     if kind.upload_mode == "oss":
-        label += "——选好后点下方「📤 上传换取临时URL」"
+        label += "——生成时自动上传换取临时URL，也可点下方「📤」预上传"
     return label
 
 
@@ -425,8 +425,8 @@ def build_app() -> gr.Blocks:
                     continue
                 label = REF_LABELS[name]
                 if kind.upload_mode == "oss":
-                    lines.append(f"- 📤 {label}：选本地文件后点「上传换取临时URL」"
-                                 f"（48 小时有效），也可直接粘贴公网 URL")
+                    lines.append(f"- 📤 {label}：本地文件生成时自动上传换取临时URL"
+                                 f"（48 小时有效），也可点「📤」预上传或直接粘贴公网 URL")
                 else:
                     lines.append(f"- {label}支持本地上传或 URL")
         return "\n".join(lines)

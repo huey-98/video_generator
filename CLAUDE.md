@@ -59,8 +59,9 @@ AI 视频生成器：基于阿里百炼平台·通义万相视频模型的 Gradi
 
 `config.yaml` 里每类参考素材有个 `upload_mode`：
 
-- `base64`（万相2.7）：本地文件直接内联 `data:...;base64,...`
-- `oss`（万相3.0 系列）：本地文件先上传到百炼**免费**临时空间，换 `oss://` 临时URL
+- `oss`（**当前所有模型统一用此**）：本地文件先上传到百炼**免费**临时空间，换 `oss://` 临时URL
+- `base64`（备用路径，代码保留）：本地文件直接内联 `data:...;base64,...`，
+  平台规则变化时可在 config.yaml 按模型切回
 
 上传流程见 `client.upload_file()`（2026-09-26 实测跑通）：取凭证 → OSS PostObject → `oss://`。
 界面上的「📤 上传换取临时URL」按钮走 `make_uploader()`；生成时也会自动补传未上传的本地文件。
@@ -78,7 +79,8 @@ AI 视频生成器：基于阿里百炼平台·通义万相视频模型的 Gradi
 
 - `type` 合法取值只有 `reference_image` / `reference_video` / `first_frame` 三个；
   `first_frame` 不能单独出现，UI 未开放该类型
-- `wan2.7-r2v`：media 数组**图+视频合计 ≤5**，至少 1 个素材，支持本地 base64 上传
+- `wan2.7-r2v`：media 数组**图+视频合计 ≤5**，至少 1 个素材；官方文档确认 media.url
+  同时支持 公网URL/oss临时URL/base64 三种形式（2026-09-27 查证），本工具统一走 oss 上传
 - `wan3.0-video` / `-prime`：图 ≤10、视频 ≤5 **分别计数**，**不收 base64**——本地文件
   必须先上传换成 `oss://` 临时URL（见下节）
 - 素材体积上限（平台）：参考图 ≤20MB、参考视频 ≤100MB；上传接口 ≤1GB

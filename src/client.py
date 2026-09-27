@@ -122,8 +122,9 @@ class BailianClient:
 
     # ---------------- 文件上传（本地文件 → 临时URL） ----------------
     #
-    # 百炼提供免费临时存储空间：上传本地文件后拿到 oss:// 形式的临时 URL，
-    # 供 wan3.0 这类「不接受 base64、只接受公网/临时URL」的模型使用。
+    # 百炼提供免费临时存储空间：上传本地文件后拿到 oss:// 形式的临时 URL。
+    # 当前所有参考素材模型统一走此路径（wan3.0 系列不收 base64 必须用；
+    # wan2.7-r2v 官方文档确认 media.url 同时支持 公网URL/oss临时URL/base64）。
     # 文档：https://help.aliyun.com/zh/model-studio/get-temporary-file-url
 
     def get_upload_policy(self, model: str) -> dict:

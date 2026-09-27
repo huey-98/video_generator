@@ -44,9 +44,11 @@ defaults:
 #                     item_type   media 元素的 type 取值（实测只有三个合法值：
 #                                 reference_image / reference_video / first_frame）
 #                     upload_mode 本地文件如何变成平台能用的地址：
-#                                 base64 = 直接内联 data:...;base64,...（体积放大 1/3）
 #                                 oss    = 先上传到百炼临时空间换成 oss:// 临时URL
-#                                          （免费、48 小时有效；平台不收 base64 时用）
+#                                          （免费、48 小时有效）——当前所有参考素材模型
+#                                          统一用此方式
+#                                 base64 = 直接内联 data:...;base64,...（体积放大 1/3），
+#                                          保留为备用路径，平台规则变化时可按模型切回
 #                 ※ 素材体积上限（平台）：参考图 ≤20MB、参考视频 ≤100MB、上传接口 ≤1GB
 #                 ※ 素材规格：参考图 ≥240×240；参考视频 mp4/mov、1~30 秒
 #   extra_params  该模型支持的额外参数（negative_prompt / seed / prompt_extend / watermark）
@@ -81,8 +83,10 @@ models:
       param: "media"
       min_total: 1     # 实测：至少要有 1 个素材（只给视频也行——单独 reference_video 能通过校验）
       max_total: 5     # 实测：media 数组最多 5 项（图 + 视频合计，超了报 "Media array is too long"）
-      image: { enabled: true, max: 5, item_type: "reference_image", upload_mode: "base64" }
-      video: { enabled: true, max: 5, item_type: "reference_video", upload_mode: "base64" }
+      # 官方文档确认 r2v 的 media.url 支持 公网URL / oss临时URL / base64 三种形式
+      #（2026-09-27 查证）；统一走 oss 上传，本地文件上限放宽到平台的 20MB/100MB
+      image: { enabled: true, max: 5, item_type: "reference_image", upload_mode: "oss" }
+      video: { enabled: true, max: 5, item_type: "reference_video", upload_mode: "oss" }
     extra_params: ["prompt_extend", "watermark"]
     price_per_second: null
 
